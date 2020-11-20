@@ -4,14 +4,15 @@ import (
 	"context"
 	"time"
 
+	"log"
+
 	"github.com/mylxsw/sshx"
-	"github.com/mylxsw/asteria/log"
 )
 
 func main() {
 	privateKeyConf := sshx.Credential{User: "root", PrivateKeyPath: "/Users/mylxsw/.ssh/id_rsa"}
 
-	rs, err := sshx.NewClient("10.0.0.2:22", privateKeyConf, sshx.SetEstablishTimeout(10*time.Second), sshx.SetLogger(log.Module("ssh")))
+	rs, err := sshx.NewClient("10.0.0.2:22", privateKeyConf, sshx.SetEstablishTimeout(10*time.Second), sshx.SetLogger(sshx.DefaultLogger{}))
 	if err != nil {
 		panic(err)
 	}
@@ -25,7 +26,7 @@ func main() {
 			return err
 		}
 
-		log.Debugf("whoami: %s", whoami)
+		log.Printf("whoami: %s", whoami)
 
 		_, err = sub.SendFile("/root/test.txt", "/Users/mylxsw/Downloads/test.txt", true, true)
 		if err != nil {
@@ -38,4 +39,3 @@ func main() {
 		panic(err)
 	}
 }
-

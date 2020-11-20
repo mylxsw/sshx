@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mylxsw/asteria/log"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -100,15 +99,20 @@ func fileExist(path string) bool {
 	return true
 }
 
+// ErrRemoteFileExisted 远程服务器已经存在该文件
 var ErrRemoteFileExisted = errors.New("remote file already exist")
+
+// ErrSessionCanceled 会话因为上下文对象的取消而被取消
 var ErrSessionCanceled = errors.New("session canceled because context canceled")
+
+// ErrFileFingerNotMatch 文件指纹不匹配
 var ErrFileFingerNotMatch = errors.New("file finger not match")
 
 type sshClient struct {
 	host      string
 	conf      *ssh.ClientConfig
 	md5sumBin string
-	logger    log.Logger
+	logger    Logger
 }
 
 // Option 用于设置连接配置
@@ -131,7 +135,7 @@ func SetMd5sumBinInServer(cmd string) Option {
 }
 
 // SetLogger 设置日志实现
-func SetLogger(logger log.Logger) Option {
+func SetLogger(logger Logger) Option {
 	return func(server *sshClient) error {
 		server.logger = logger
 		return nil
@@ -156,7 +160,7 @@ func NewClient(serverAddr string, credential Credential, opts ...Option) (Client
 		server.md5sumBin = "/usr/bin/md5sum"
 	}
 	if server.logger == nil {
-		server.logger = log.Default()
+		server.logger = DefaultLogger{}
 	}
 
 	return server, nil
@@ -184,7 +188,7 @@ func (s *sshClient) transferFile(client *ssh.Client, dest string, src string, ov
 		return 0, ErrRemoteFileExisted
 	}
 
-	destTmp := filepath.Join(filepath.Dir(dest), fmt.Sprintf("%client.tmp_%d", filepath.Base(dest), time.Now().UnixNano()))
+	destTmp := filepath.Join(filepath.Dir(dest), fmt.Sprintf("%s.tmp_%d", filepath.Base(dest), time.Now().UnixNano()))
 	written, err = s.transferToRemoteTmp(sftpClient, destTmp, src)
 	if err != nil {
 		return 0, fmt.Errorf("transfer local file to remote failed: %w", err)
@@ -341,4 +345,3 @@ func md5file(filename string) string {
 	file, _ := ioutil.ReadFile(filename)
 	return fmt.Sprintf("%x", md5.Sum(file))
 }
-
