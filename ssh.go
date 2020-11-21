@@ -20,7 +20,7 @@ import (
 
 type Client interface {
 	SendFile(destFilepath string, srcFilepath string, override bool, consistencyCheck bool) (written int64, err error)
-	Command(ctx context.Context, cmd string) ([]byte, error)
+	Command(ctx context.Context, cmd string, opts ...SessionOption) ([]byte, error)
 	Handle(handler Handler) error
 }
 
@@ -267,19 +267,35 @@ func (s *sshClient) remoteFileExist(client *sftp.Client, path string) bool {
 	return true
 }
 
-func (s *sshClient) ssh(ctx context.Context, client *ssh.Client, cmd string) ([]byte, error) {
+type SessionOption func(session *ssh.Session) error
+
+func RequestPty(width int, height int, terminalModes ...ssh.TerminalModes) SessionOption {
+	if len(terminalModes) == 0 {
+		terminalModes = []ssh.TerminalModes{
+			{
+				ssh.ECHO:          0,
+				ssh.TTY_OP_ISPEED: 14400,
+				ssh.TTY_OP_OSPEED: 14400,
+			},
+		}
+	}
+
+	return func(session *ssh.Session) error {
+		return session.RequestPty("xterm", width, height, terminalModes[0])
+	}
+}
+
+func (s *sshClient) ssh(ctx context.Context, client *ssh.Client, cmd string, opts ...SessionOption) ([]byte, error) {
 	session, err := client.NewSession()
 	if err != nil {
 		return nil, fmt.Errorf("create session failed: %w", err)
 	}
 	defer session.Close()
 
-	if err := session.RequestPty("xterm", 80, 40, ssh.TerminalModes{
-		ssh.ECHO:          0,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}); err != nil {
-		return nil, err
+	for _, opt := range opts {
+		if err := opt(session); err != nil {
+			return nil, err
+		}
 	}
 
 	var resp []byte
@@ -300,14 +316,14 @@ func (s *sshClient) ssh(ctx context.Context, client *ssh.Client, cmd string) ([]
 }
 
 // Command 在远程服务器上执行命令
-func (s *sshClient) Command(ctx context.Context, cmd string) ([]byte, error) {
+func (s *sshClient) Command(ctx context.Context, cmd string, opts ...SessionOption) ([]byte, error) {
 	client, err := ssh.Dial("tcp", s.host, s.conf)
 	if err != nil {
 		return nil, err
 	}
 	defer client.Close()
 
-	return s.ssh(ctx, client, cmd)
+	return s.ssh(ctx, client, cmd, opts...)
 }
 
 // Handle 在同一个连接中执行 handler 中的所有操作
@@ -333,8 +349,8 @@ func (sc *subClient) SendFile(destFilepath string, srcFilepath string, override 
 	return sc.client.transferFile(sc.conn, destFilepath, srcFilepath, override, consistencyCheck)
 }
 
-func (sc *subClient) Command(ctx context.Context, cmd string) ([]byte, error) {
-	return sc.client.ssh(ctx, sc.conn, cmd)
+func (sc *subClient) Command(ctx context.Context, cmd string, opts ...SessionOption) ([]byte, error) {
+	return sc.client.ssh(ctx, sc.conn, cmd, opts...)
 }
 
 func (sc *subClient) Handle(handler Handler) error {
