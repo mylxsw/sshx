@@ -37,7 +37,8 @@ type EnhanceClient interface {
 	WriteFileOverride(destFilepath string, dataReader io.Reader) (written int64, err error)
 	SendDirectory(destDirectory string, srcDirectory string) error
 	SendFiles(destDirectory string, srcFiles ...string) error
-	WriteToTemp(dataReader io.Reader, fn func(tempFilepath string) error) error
+	TempWriteFile(dataReader io.Reader, fn func(tempFilepath string) error) error
+	TempSendFile(srcFilepath string, fn func(tempFilepath string) error) error
 
 	Create(path string) (*sftp.File, error)
 	Walk(root string) *fs.Walker
@@ -227,7 +228,7 @@ func (s *sshClient) writeFile(sftpClient *sftp.Client, dest string, dataReader i
 }
 
 func (s *sshClient) generateTempFilename(dest string) string {
-	return filepath.Join(filepath.Dir(dest), fmt.Sprintf("%s.tmp_%d", filepath.Base(dest), time.Now().UnixNano()))
+	return filepath.Join(filepath.Dir(dest), fmt.Sprintf(".sshx_tmp_%x%s", md5.Sum([]byte(fmt.Sprintf("%s-%d", filepath.Base(dest), time.Now().UnixNano()))), filepath.Ext(dest)))
 }
 
 func (s *sshClient) transferFile(sftpClient *sftp.Client, dest string, src string, override bool, checkConsistency bool) (written int64, err error) {
@@ -246,7 +247,7 @@ func (s *sshClient) transferFile(sftpClient *sftp.Client, dest string, src strin
 		return 0, ErrRemoteFileExisted
 	}
 
-	destTmp := filepath.Join(filepath.Dir(dest), fmt.Sprintf("%s.tmp_%d", filepath.Base(dest), time.Now().UnixNano()))
+	destTmp := s.generateTempFilename(dest)
 	written, err = s.transferToRemoteTmp(sftpClient, destTmp, src)
 	if err != nil {
 		return 0, fmt.Errorf("transfer local file to remote failed: %w", err)
@@ -602,8 +603,8 @@ func (sc *subClient) SendFileOverride(destFilepath string, srcFilepath string) (
 	return sc.SendFile(destFilepath, srcFilepath, true, false)
 }
 
-func (sc *subClient) WriteToTemp(dataReader io.Reader, fn func(tempFilepath string) error) error {
-	tempFilepath := sc.client.generateTempFilename(fmt.Sprintf("%f", rand.Float64()))
+func (sc *subClient) TempWriteFile(dataReader io.Reader, fn func(tempFilepath string) error) error {
+	tempFilepath := sc.client.generateTempFilename(fmt.Sprintf("%d-%f.tmp", time.Now().Nanosecond(), rand.Float64()*10000))
 	_, err := sc.WriteFileOverride(tempFilepath, dataReader)
 	if err != nil {
 		return err
@@ -611,6 +612,15 @@ func (sc *subClient) WriteToTemp(dataReader io.Reader, fn func(tempFilepath stri
 	defer sc.sftpClient.Remove(tempFilepath)
 
 	return fn(tempFilepath)
+}
+
+func (sc *subClient) TempSendFile(srcFilepath string, fn func(tempFilepath string) error) error {
+	srcFile, err := os.Open(srcFilepath)
+	if err != nil {
+		return err
+	}
+
+	return sc.TempWriteFile(srcFile, fn)
 }
 
 func (sc *subClient) Command(ctx context.Context, cmd string, opts ...SessionOption) ([]byte, error) {

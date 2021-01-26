@@ -51,6 +51,20 @@ func main() {
 		}
 		log.Printf("ps ef: %s", string(psef))
 
+		if err := sub.TempWriteFile(strings.NewReader("Yes!"), func(tempFilepath string) error {
+			log.Printf("temp file: %s", tempFilepath)
+			res, err := sub.Command(context.TODO(), "cat "+tempFilepath)
+			if err != nil {
+				return err
+			}
+
+			log.Printf("temp file content: %s", string(res))
+
+			return nil
+		}); err != nil {
+			return err
+		}
+
 		//if err := sub.SendDirectory("/root/temp", "/Users/mylxsw/codes/github/sshx"); err != nil {
 		//	return err
 		//}
