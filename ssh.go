@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/kr/fs"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -20,11 +22,50 @@ import (
 
 type Client interface {
 	SendFile(destFilepath string, srcFilepath string, override bool, consistencyCheck bool) (written int64, err error)
+	WriteFile(destFilepath string, dataReader io.Reader, override bool) (written int64, err error)
+	SendFileOverride(destFilepath string, srcFilepath string) (written int64, err error)
+	WriteFileOverride(destFilepath string, dataReader io.Reader) (written int64, err error)
 	Command(ctx context.Context, cmd string, opts ...SessionOption) ([]byte, error)
 	Handle(handler Handler) error
 }
 
-type Handler func(sub Client) error
+type EnhanceClient interface {
+	SendFile(destFilepath string, srcFilepath string, override bool, consistencyCheck bool) (written int64, err error)
+	WriteFile(destFilepath string, dataReader io.Reader, override bool) (written int64, err error)
+	Command(ctx context.Context, cmd string, opts ...SessionOption) ([]byte, error)
+	SendFileOverride(destFilepath string, srcFilepath string) (written int64, err error)
+	WriteFileOverride(destFilepath string, dataReader io.Reader) (written int64, err error)
+	SendDirectory(destDirectory string, srcDirectory string) error
+	SendFiles(destDirectory string, srcFiles ...string) error
+	WriteToTemp(dataReader io.Reader, fn func(tempFilepath string) error) error
+
+	Create(path string) (*sftp.File, error)
+	Walk(root string) *fs.Walker
+	ReadDir(p string) ([]os.FileInfo, error)
+	Stat(p string) (os.FileInfo, error)
+	Lstat(p string) (os.FileInfo, error)
+	ReadLink(p string) (string, error)
+	Link(oldname, newname string) error
+	Symlink(oldname, newname string) error
+	Chtimes(path string, atime time.Time, mtime time.Time) error
+	Chown(path string, uid, gid int) error
+	Chmod(path string, mode os.FileMode) error
+	Truncate(path string, size int64) error
+	Open(path string) (*sftp.File, error)
+	OpenFile(path string, f int) (*sftp.File, error)
+	StatVFS(path string) (*sftp.StatVFS, error)
+	Join(elem ...string) string
+	Remove(path string) error
+	RemoveDirectory(path string) error
+	Rename(oldname, newname string) error
+	PosixRename(oldname, newname string) error
+	Getwd() (string, error)
+	Mkdir(path string) error
+	MkdirAll(path string) error
+	Glob(pattern string) (matches []string, err error)
+}
+
+type Handler func(sub EnhanceClient) error
 
 // Credential Command 连接配置
 type Credential struct {
@@ -166,13 +207,30 @@ func NewClient(serverAddr string, credential Credential, opts ...Option) (Client
 	return server, nil
 }
 
-func (s *sshClient) transferFile(client *ssh.Client, dest string, src string, override bool, checkConsistency bool) (written int64, err error) {
-	sftpClient, err := sftp.NewClient(client)
-	if err != nil {
-		return 0, fmt.Errorf("creates SFTP client failed: %w", err)
+func (s *sshClient) writeFile(sftpClient *sftp.Client, dest string, dataReader io.Reader, override bool) (written int64, err error) {
+	if !override && s.remoteFileExist(sftpClient, dest) {
+		return 0, ErrRemoteFileExisted
 	}
-	defer sftpClient.Close()
 
+	destTmp := s.generateTempFilename(dest)
+	written, err = s.writeToRemoteTmp(sftpClient, destTmp, dataReader)
+	if err != nil {
+		return 0, fmt.Errorf("transfer local file to remote failed: %w", err)
+	}
+	defer sftpClient.Remove(destTmp)
+
+	if err := sftpClient.PosixRename(destTmp, dest); err != nil {
+		return 0, err
+	}
+
+	return written, nil
+}
+
+func (s *sshClient) generateTempFilename(dest string) string {
+	return filepath.Join(filepath.Dir(dest), fmt.Sprintf("%s.tmp_%d", filepath.Base(dest), time.Now().UnixNano()))
+}
+
+func (s *sshClient) transferFile(sftpClient *sftp.Client, dest string, src string, override bool, checkConsistency bool) (written int64, err error) {
 	if !override && s.remoteFileExist(sftpClient, dest) {
 		if checkConsistency {
 			matched, err := s.checkFileConsistency(src, dest)
@@ -213,6 +271,30 @@ func (s *sshClient) transferFile(client *ssh.Client, dest string, src string, ov
 	return written, nil
 }
 
+func (s *sshClient) WriteFileOverride(dest string, dataReader io.Reader) (written int64, err error) {
+	return s.WriteFile(dest, dataReader, true)
+}
+
+func (s *sshClient) WriteFile(dest string, dataReader io.Reader, override bool) (written int64, err error) {
+	conn, err := ssh.Dial("tcp", s.host, s.conf)
+	if err != nil {
+		return 0, fmt.Errorf("can not establish a connection to %s: %w", s.host, err)
+	}
+	defer conn.Close()
+
+	sftpClient, err := sftp.NewClient(conn)
+	if err != nil {
+		return 0, fmt.Errorf("creates SFTP client failed: %w", err)
+	}
+	defer sftpClient.Close()
+
+	return s.writeFile(sftpClient, dest, dataReader, override)
+}
+
+func (s *sshClient) SendFileOverride(dest string, src string) (written int64, err error) {
+	return s.SendFile(dest, src, true, false)
+}
+
 // SendFile 将本地文件传输到远程服务器
 func (s *sshClient) SendFile(dest string, src string, override bool, consistencyCheck bool) (written int64, err error) {
 	conn, err := ssh.Dial("tcp", s.host, s.conf)
@@ -221,7 +303,45 @@ func (s *sshClient) SendFile(dest string, src string, override bool, consistency
 	}
 	defer conn.Close()
 
-	return s.transferFile(conn, dest, src, override, consistencyCheck)
+	sftpClient, err := sftp.NewClient(conn)
+	if err != nil {
+		return 0, fmt.Errorf("creates SFTP client failed: %w", err)
+	}
+	defer sftpClient.Close()
+
+	return s.transferFile(sftpClient, dest, src, override, consistencyCheck)
+}
+
+// Command 在远程服务器上执行命令
+func (s *sshClient) Command(ctx context.Context, cmd string, opts ...SessionOption) ([]byte, error) {
+	client, err := ssh.Dial("tcp", s.host, s.conf)
+	if err != nil {
+		return nil, fmt.Errorf("can not establish a connection to %s: %w", s.host, err)
+	}
+	defer client.Close()
+
+	return s.ssh(ctx, client, cmd, opts...)
+}
+
+// Handle 在同一个连接中执行 handler 中的所有操作
+func (s *sshClient) Handle(handler Handler) error {
+	conn, err := ssh.Dial("tcp", s.host, s.conf)
+	if err != nil {
+		return fmt.Errorf("can not establish a connection to %s: %w", s.host, err)
+	}
+	defer conn.Close()
+
+	sftpClient, err := sftp.NewClient(conn)
+	if err != nil {
+		return fmt.Errorf("creates SFTP client failed: %w", err)
+	}
+	defer sftpClient.Close()
+
+	return handler(&subClient{
+		client:     s,
+		sftpClient: sftpClient,
+		conn:       conn,
+	})
 }
 
 func (s *sshClient) checkFileConsistency(src string, remoteDest string) (bool, error) {
@@ -242,6 +362,16 @@ func (s *sshClient) checkFileConsistency(src string, remoteDest string) (bool, e
 	return strings.EqualFold(localFinger, remoteFinger[0]), nil
 }
 
+func (s *sshClient) writeToRemoteTmp(client *sftp.Client, destTmp string, dataReader io.Reader) (int64, error) {
+	destFile, err := client.Create(destTmp)
+	if err != nil {
+		return 0, fmt.Errorf("create remote temp file %s failed: %w", destTmp, err)
+	}
+	defer destFile.Close()
+
+	return io.Copy(destFile, dataReader)
+}
+
 func (s *sshClient) transferToRemoteTmp(client *sftp.Client, destTmp string, src string) (int64, error) {
 	srcFile, err := os.Open(src)
 	if err != nil {
@@ -249,13 +379,7 @@ func (s *sshClient) transferToRemoteTmp(client *sftp.Client, destTmp string, src
 	}
 	defer srcFile.Close()
 
-	destFile, err := client.Create(destTmp)
-	if err != nil {
-		return 0, fmt.Errorf("create remote temp file %s failed: %w", destTmp, err)
-	}
-	defer destFile.Close()
-
-	return io.Copy(destFile, srcFile)
+	return s.writeToRemoteTmp(client, destTmp, srcFile)
 }
 
 func (s *sshClient) remoteFileExist(client *sftp.Client, path string) bool {
@@ -315,46 +439,182 @@ func (s *sshClient) ssh(ctx context.Context, client *ssh.Client, cmd string, opt
 	return resp, err
 }
 
-// Command 在远程服务器上执行命令
-func (s *sshClient) Command(ctx context.Context, cmd string, opts ...SessionOption) ([]byte, error) {
-	client, err := ssh.Dial("tcp", s.host, s.conf)
-	if err != nil {
-		return nil, err
-	}
-	defer client.Close()
-
-	return s.ssh(ctx, client, cmd, opts...)
-}
-
-// Handle 在同一个连接中执行 handler 中的所有操作
-func (s *sshClient) Handle(handler Handler) error {
-	conn, err := ssh.Dial("tcp", s.host, s.conf)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	return handler(&subClient{
-		client: s,
-		conn:   conn,
-	})
-}
-
 type subClient struct {
-	client *sshClient
-	conn   *ssh.Client
+	client     *sshClient
+	sftpClient *sftp.Client
+	conn       *ssh.Client
+}
+
+func (sc *subClient) Create(path string) (*sftp.File, error) {
+	return sc.sftpClient.Create(path)
+}
+
+func (sc *subClient) Walk(root string) *fs.Walker {
+	return sc.sftpClient.Walk(root)
+}
+
+func (sc *subClient) ReadDir(p string) ([]os.FileInfo, error) {
+	return sc.sftpClient.ReadDir(p)
+}
+
+func (sc *subClient) Stat(p string) (os.FileInfo, error) {
+	return sc.sftpClient.Stat(p)
+}
+
+func (sc *subClient) Lstat(p string) (os.FileInfo, error) {
+	return sc.sftpClient.Lstat(p)
+}
+
+func (sc *subClient) ReadLink(p string) (string, error) {
+	return sc.sftpClient.ReadLink(p)
+}
+
+func (sc *subClient) Link(oldname, newname string) error {
+	return sc.sftpClient.Link(oldname, newname)
+}
+
+func (sc *subClient) Symlink(oldname, newname string) error {
+	return sc.sftpClient.Symlink(oldname, newname)
+}
+
+func (sc *subClient) Chtimes(path string, atime time.Time, mtime time.Time) error {
+	return sc.sftpClient.Chtimes(path, atime, mtime)
+}
+
+func (sc *subClient) Chown(path string, uid, gid int) error {
+	return sc.sftpClient.Chown(path, uid, gid)
+}
+
+func (sc *subClient) Chmod(path string, mode os.FileMode) error {
+	return sc.sftpClient.Chmod(path, mode)
+}
+
+func (sc *subClient) Truncate(path string, size int64) error {
+	return sc.sftpClient.Truncate(path, size)
+}
+
+func (sc *subClient) Open(path string) (*sftp.File, error) {
+	return sc.sftpClient.Open(path)
+}
+
+func (sc *subClient) OpenFile(path string, f int) (*sftp.File, error) {
+	return sc.sftpClient.OpenFile(path, f)
+}
+
+func (sc *subClient) StatVFS(path string) (*sftp.StatVFS, error) {
+	return sc.sftpClient.StatVFS(path)
+}
+
+func (sc *subClient) Join(elem ...string) string {
+	return sc.sftpClient.Join(elem...)
+}
+
+func (sc *subClient) Remove(path string) error {
+	return sc.sftpClient.Remove(path)
+}
+
+func (sc *subClient) RemoveDirectory(path string) error {
+	return sc.sftpClient.RemoveDirectory(path)
+}
+
+func (sc *subClient) Rename(oldname, newname string) error {
+	return sc.sftpClient.Rename(oldname, newname)
+}
+
+func (sc *subClient) PosixRename(oldname, newname string) error {
+	return sc.sftpClient.PosixRename(oldname, newname)
+}
+
+func (sc *subClient) Getwd() (string, error) {
+	return sc.sftpClient.Getwd()
+}
+
+func (sc *subClient) Mkdir(path string) error {
+	return sc.sftpClient.Mkdir(path)
+}
+
+func (sc *subClient) MkdirAll(path string) error {
+	return sc.sftpClient.MkdirAll(path)
+}
+
+func (sc *subClient) Glob(pattern string) (matches []string, err error) {
+	return sc.sftpClient.Glob(pattern)
 }
 
 func (sc *subClient) SendFile(destFilepath string, srcFilepath string, override bool, consistencyCheck bool) (written int64, err error) {
-	return sc.client.transferFile(sc.conn, destFilepath, srcFilepath, override, consistencyCheck)
+	return sc.client.transferFile(sc.sftpClient, destFilepath, srcFilepath, override, consistencyCheck)
+}
+
+func (sc *subClient) WriteFile(destFilepath string, dataReader io.Reader, override bool) (written int64, err error) {
+	return sc.client.writeFile(sc.sftpClient, destFilepath, dataReader, override)
+}
+
+func (sc *subClient) WriteFileOverride(destFilepath string, dataReader io.Reader) (written int64, err error) {
+	return sc.WriteFile(destFilepath, dataReader, true)
+}
+
+func (sc *subClient) SendFiles(destDirectory string, srcFiles ...string) error {
+	if err := sc.MkdirAll(destDirectory); err != nil {
+		return err
+	}
+
+	for _, src := range srcFiles {
+		if _, err := sc.SendFile(filepath.Join(destDirectory, filepath.Base(src)), src, true, false); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (sc *subClient) SendDirectory(destDirectory string, srcDirectory string) error {
+	if err := sc.MkdirAll(destDirectory); err != nil {
+		return err
+	}
+
+	return filepath.Walk(srcDirectory, func(path string, info os.FileInfo, err error) error {
+		relPath, err := filepath.Rel(srcDirectory, path)
+		if err != nil {
+			return err
+		}
+
+		targetPath := filepath.Join(destDirectory, relPath)
+		if info.IsDir() {
+			if err := sc.MkdirAll(targetPath); err != nil {
+				return err
+			}
+
+			return nil
+		}
+
+		if !sc.client.remoteFileExist(sc.sftpClient, filepath.Dir(targetPath)) {
+			if err := sc.MkdirAll(filepath.Dir(targetPath)); err != nil {
+				return err
+			}
+		}
+
+		_, err = sc.SendFileOverride(targetPath, path)
+		return err
+	})
+}
+
+func (sc *subClient) SendFileOverride(destFilepath string, srcFilepath string) (written int64, err error) {
+	return sc.SendFile(destFilepath, srcFilepath, true, false)
+}
+
+func (sc *subClient) WriteToTemp(dataReader io.Reader, fn func(tempFilepath string) error) error {
+	tempFilepath := sc.client.generateTempFilename(fmt.Sprintf("%f", rand.Float64()))
+	_, err := sc.WriteFileOverride(tempFilepath, dataReader)
+	if err != nil {
+		return err
+	}
+	defer sc.sftpClient.Remove(tempFilepath)
+
+	return fn(tempFilepath)
 }
 
 func (sc *subClient) Command(ctx context.Context, cmd string, opts ...SessionOption) ([]byte, error) {
 	return sc.client.ssh(ctx, sc.conn, cmd, opts...)
-}
-
-func (sc *subClient) Handle(handler Handler) error {
-	return handler(sc)
 }
 
 func md5file(filename string) string {

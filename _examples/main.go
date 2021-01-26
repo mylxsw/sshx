@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/mylxsw/sshx"
@@ -19,7 +20,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := rs.Handle(func(sub sshx.Client) error {
+	if err := rs.Handle(func(sub sshx.EnhanceClient) error {
 		whoami, err := sub.Command(ctx, "whoami")
 		if err != nil {
 			return err
@@ -27,19 +28,34 @@ func main() {
 
 		log.Printf("whoami: %s", whoami)
 
-		_, err = sub.SendFile("/root/test.txt", "/Users/mylxsw/Downloads/test.txt", true, true)
+		dataReader := strings.NewReader("Hello, world")
+		_, err = sub.WriteFileOverride("/root/test.txt", dataReader)
 		if err != nil {
 			return err
 		}
 
-		_, err = sub.Command(ctx, "cat /root/test.txt && rm -f /root/test.txt")
+		hello, err := sub.Command(ctx, "cat /root/test.txt")
 		if err != nil {
+			return err
+		}
+
+		log.Printf("res: %s", hello)
+
+		if err := sub.Remove("/root/test.txt"); err != nil {
 			return err
 		}
 
 		psef, err := sub.Command(ctx, "ps -ef", sshx.RequestPty(120, 100))
+		if err != nil {
+			return err
+		}
 		log.Printf("ps ef: %s", string(psef))
-		return err
+
+		//if err := sub.SendDirectory("/root/temp", "/Users/mylxsw/codes/github/sshx"); err != nil {
+		//	return err
+		//}
+
+		return nil
 	}); err != nil {
 		panic(err)
 	}

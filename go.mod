@@ -4,6 +4,7 @@ go 1.14
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/kr/fs v0.1.0
 	github.com/kr/pretty v0.1.0 // indirect
 	github.com/pkg/sftp v1.12.0
 	golang.org/x/crypto v0.0.0-20201117144127-c1f2f97bffc9
