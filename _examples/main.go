@@ -23,6 +23,17 @@ func main() {
 	defer cancel()
 
 	if err := rs.Handle(func(sub sshx.EnhanceClient) error {
+		// if _, err := sub.ReceiveFile("/tmp/xxx", "/etc/passwd", false, true); err != nil {
+		// 	panic(err)
+		// }
+
+		data, err := sub.ReadFile("/etc/filebeat/filebeat.yml")
+		if err != nil {
+			panic(err)
+		}
+
+		log.Printf("filebeat yml: %s", string(data))
+
 		if err := sub.TempSendFile("./bin/cmd-simulator", func(tempFilepath string) error {
 			res, err := sub.Command(ctx, fmt.Sprintf("chmod +x ./%s && ./%s -stdout Hello -stderr 'This is an error' -return-code 3", tempFilepath, tempFilepath))
 			if err != nil {
