@@ -69,9 +69,11 @@ type EnhanceClient interface {
 type Handler func(sub EnhanceClient) error
 
 // Credential Command 连接配置
+// 优先级： Password > PrivateKey > PrivateKeyPath
 type Credential struct {
 	User                 string
 	Password             string
+	PrivateKey           string
 	PrivateKeyPath       string
 	PrivateKeyPassphrase string
 }
@@ -85,6 +87,13 @@ func (sc Credential) buildSSHClientConfig() (*ssh.ClientConfig, error) {
 
 	if sc.Password != "" {
 		conf.Auth = append(conf.Auth, ssh.Password(sc.Password))
+	} else if sc.PrivateKey != "" {
+		pk, err := sc.parsePrivateKey(sc.PrivateKey)
+		if err != nil {
+			return nil, err
+		}
+
+		conf.Auth = append(conf.Auth, pk)
 	} else if sc.PrivateKeyPath != "" {
 		pk, err := sc.getPrivateKey(sc.PrivateKeyPath, sc.PrivateKeyPassphrase)
 		if err != nil {
@@ -106,6 +115,16 @@ func (sc Credential) buildSSHClientConfig() (*ssh.ClientConfig, error) {
 	}
 
 	return &conf, nil
+}
+
+// parsePrivateKey parse a private key from input
+func (sc Credential) parsePrivateKey(privateKey string) (ssh.AuthMethod, error) {
+	signer, err := ssh.ParsePrivateKey([]byte(privateKey))
+	if err != nil {
+		return nil, fmt.Errorf("parse private key failed: %v", err)
+	}
+
+	return ssh.PublicKeys(signer), nil
 }
 
 // Get the private key for current user

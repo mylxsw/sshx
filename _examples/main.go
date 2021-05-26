@@ -11,7 +11,7 @@ import (
 
 func main() {
 	// 创建鉴权秘钥
-	privateKeyConf := sshx.Credential{User: "root", PrivateKeyPath: "/Users/mylxsw/.ssh/id_rsa"}
+	privateKeyConf := sshx.Credential{User: "root", PrivateKeyPath: "/home/mylxsw/.ssh/id_rsa"}
 
 	// 创建 sshx 客户端
 	rs, err := sshx.NewClient("192.168.1.225:22", privateKeyConf, sshx.SetEstablishTimeout(10*time.Second), sshx.SetLogger(sshx.DefaultLogger{}))
